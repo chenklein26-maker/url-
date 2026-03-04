@@ -17,7 +17,11 @@ import {
   Copy,
   LayoutGrid,
   List as ListIcon,
-  Play
+  Play,
+  Folder,
+  ChevronLeft,
+  Search,
+  X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
@@ -97,7 +101,12 @@ export default function App() {
     return localStorage.getItem('article_flow_active_prompt_id_v2') || DEFAULT_PROMPTS[0].id;
   });
   
+  const [imageSavePath, setImageSavePath] = useState(() => {
+    return localStorage.getItem('article_flow_image_save_path') || '';
+  });
+  
   const [editingPrompt, setEditingPrompt] = useState<Prompt | null>(null);
+  const [nativeFolderHandle, setNativeFolderHandle] = useState<any>(null);
 
   const activePrompt = useMemo(() => 
     prompts.find(p => p.id === activePromptId) || prompts[0], 
@@ -111,6 +120,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('article_flow_active_prompt_id_v2', activePromptId);
   }, [activePromptId]);
+
+  useEffect(() => {
+    localStorage.setItem('article_flow_image_save_path', imageSavePath);
+  }, [imageSavePath]);
 
   const [tasks, setTasks] = useState<Task[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -134,6 +147,30 @@ export default function App() {
     }
   };
 
+  const callGeminiWithRetry = async (params: any, maxRetries = 3): Promise<any> => {
+    let lastError: any;
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        return await ai.models.generateContent(params);
+      } catch (err: any) {
+        lastError = err;
+        const errorStr = err.message || '';
+        if (errorStr.includes('429') || errorStr.includes('RESOURCE_EXHAUSTED')) {
+          let waitTime = Math.pow(2, i) * 2000;
+          const match = errorStr.match(/retry in ([\d.]+)s/);
+          if (match) {
+            waitTime = parseFloat(match[1]) * 1000 + 1000;
+          }
+          console.log(`Quota exceeded, retrying in ${waitTime}ms... (Attempt ${i + 1}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastError;
+  };
+
   const processTask = async (taskId: string) => {
     try {
       // 1. Extract Article
@@ -153,7 +190,7 @@ export default function App() {
       setTasks(prev => prev.map(t => t.id === taskId ? { ...t, articleData: data, status: 'polishing' } : t));
 
       // 2. Polish Content
-      const response = await ai.models.generateContent({
+      const response = await callGeminiWithRetry({
         model: "gemini-3-flash-preview",
         contents: `你是一位经验丰富的编辑。请严格按照以下要求润色文章，并输出为标准的 HTML 格式（仅包含 <p>, <strong>, <a> 等标签，不要包含 <html> 或 <body>）：
 要求：${activePrompt.content}
@@ -165,7 +202,7 @@ export default function App() {
 请直接输出润色后的 HTML 全文。注意：
 1. 忽略任何导航菜单、面包屑、页脚或其他非正文内容。
 2. 不要包含任何多余的解释、Markdown 代码块标记（如 \`\`\`html）或注释。
-3. 严格遵循 HTML 结构要求（<p>\\n\\t...）。`,
+3. 严格遵循 HTML 结构要求（<p>\n\t...）。`,
       });
       
       let polished = response.text || '';
@@ -178,15 +215,42 @@ export default function App() {
       const imageRes = await fetch('/api/process-images', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ images: data.images, taskId: taskId })
+        body: JSON.stringify({ 
+          images: data.images, 
+          taskId: taskId,
+          imageSavePath: imageSavePath // Pass the custom path to backend
+        })
       });
       
       if (!imageRes.ok) throw new Error('图片处理失败。');
       const imageData = await imageRes.json();
+      
+      // If native folder is selected, save images to it
+      if (nativeFolderHandle && imageData.results) {
+        for (const img of imageData.results) {
+          if (img.success && img.processed) {
+            try {
+              const res = await fetch(img.processed);
+              const blob = await res.blob();
+              const fileHandle = await nativeFolderHandle.getFileHandle(img.filename, { create: true });
+              const writable = await fileHandle.createWritable();
+              await writable.write(blob);
+              await writable.close();
+            } catch (err) {
+              console.error(`Failed to save ${img.filename} to native folder:`, err);
+            }
+          }
+        }
+      }
+
       setTasks(prev => prev.map(t => t.id === taskId ? { ...t, processedImages: imageData.results, status: 'done' } : t));
 
     } catch (err: any) {
-      setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'error', error: err.message } : t));
+      let errorMessage = err.message || '未知错误';
+      if (errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
+        errorMessage = 'API 调用额度已耗尽或请求过于频繁。系统已尝试自动重试，但仍未成功。请稍等片刻后再试。';
+      }
+      setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'error', error: errorMessage } : t));
     }
   };
 
@@ -286,6 +350,37 @@ export default function App() {
               </div>
               
               <div className="p-6 bg-neutral-50 rounded-2xl border border-black/5 space-y-4">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between px-1">
+                    <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-widest flex items-center gap-1">
+                      <Folder size={10} /> 本地保存路径 (原生弹窗)
+                    </span>
+                  </div>
+                  <div className="flex gap-2">
+                    <div className="flex-1 px-3 py-2 text-xs rounded-xl border border-neutral-200 bg-white truncate">
+                      {nativeFolderHandle ? (
+                        <span className="text-emerald-600 font-bold">已选择: {nativeFolderHandle.name}</span>
+                      ) : (
+                        <span className="text-neutral-400">未选择文件夹</span>
+                      )}
+                    </div>
+                    <button 
+                      onClick={async () => {
+                        try {
+                          const handle = await (window as any).showDirectoryPicker();
+                          setNativeFolderHandle(handle);
+                        } catch (err) {
+                          console.error('Picker cancelled or failed', err);
+                        }
+                      }}
+                      className="px-3 py-2 bg-emerald-500 text-white rounded-xl text-xs font-bold hover:bg-emerald-600 transition-all flex items-center gap-1"
+                    >
+                      <Folder size={14} /> 选择
+                    </button>
+                  </div>
+                  <p className="text-[9px] text-neutral-400 px-1">处理完成后图片将自动保存至该文件夹</p>
+                </div>
+
                 <textarea 
                   placeholder="输入 URL (每行一个)"
                   value={urlInput}

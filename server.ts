@@ -12,6 +12,9 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Simple lock for sequential image processing to avoid race conditions in naming
+let imageProcessingLock = Promise.resolve();
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -79,49 +82,88 @@ async function startServer() {
 
   // API: Process images
   app.post("/api/process-images", async (req, res) => {
-    const { images, taskId } = req.body;
+    const { images, taskId, imageSavePath } = req.body;
     if (!images || !Array.isArray(images)) {
       return res.status(400).json({ error: "Images array is required" });
     }
 
-    const id = taskId || Date.now().toString();
-    const taskDir = path.join(processedDir, id);
-    if (!fs.existsSync(taskDir)) {
-      fs.mkdirSync(taskDir, { recursive: true });
-    }
+    // Use a lock to ensure sequential naming across concurrent requests
+    await imageProcessingLock;
+    
+    let unlock: () => void;
+    imageProcessingLock = new Promise(resolve => { unlock = resolve; });
 
-    const results = [];
-    let count = 1;
-    for (const imageUrl of images) {
-      try {
-        const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-        const buffer = Buffer.from(response.data);
-        
-        const filename = `${count}.jpg`;
-        const outputPath = path.join(taskDir, filename);
+    try {
+      // Priority: 1. Body param (from UI), 2. Env var, 3. Default processedDir
+      const baseSavePath = imageSavePath || process.env.IMAGE_SAVE_PATH || processedDir;
+      
+      const useFlatStructure = !!(imageSavePath || process.env.IMAGE_SAVE_PATH);
+      const targetDir = useFlatStructure ? baseSavePath : path.join(baseSavePath, taskId || Date.now().toString());
 
-        await sharp(buffer)
-          .resize(500)
-          .toFormat('jpeg')
-          .toFile(outputPath);
-
-        results.push({
-          original: imageUrl,
-          processed: `/processed/${id}/${filename}`,
-          success: true
-        });
-        count++;
-      } catch (error: any) {
-        console.error(`Error processing image ${imageUrl}:`, error.message);
-        results.push({
-          original: imageUrl,
-          error: error.message,
-          success: false
-        });
+      if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
       }
-    }
 
-    res.json({ results });
+      // Helper to get next sequence number if flat structure is used
+      const getNextSequence = () => {
+        if (!useFlatStructure) return null;
+        try {
+          const files = fs.readdirSync(targetDir);
+          const numbers = files
+            .map(f => parseInt(path.parse(f).name))
+            .filter(n => !isNaN(n));
+          return numbers.length > 0 ? Math.max(...numbers) + 1 : 1;
+        } catch (e) {
+          return 1;
+        }
+      };
+
+      let globalCount = getNextSequence();
+      const results = [];
+      let localCount = 1;
+
+      for (const imageUrl of images) {
+        try {
+          const response = await axios.get(imageUrl, { 
+            responseType: 'arraybuffer',
+            timeout: 10000,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+          });
+          const buffer = Buffer.from(response.data);
+          
+          const filename = globalCount !== null ? `${globalCount}.jpg` : `${localCount}.jpg`;
+          const outputPath = path.join(targetDir, filename);
+
+          await sharp(buffer)
+            .resize({ width: 1200, withoutEnlargement: true })
+            .toFormat('jpeg', { quality: 85 })
+            .toFile(outputPath);
+
+          results.push({
+            original: imageUrl,
+            processed: useFlatStructure ? `file://${outputPath}` : `/processed/${taskId}/${filename}`,
+            filename: filename,
+            success: true
+          });
+
+          if (globalCount !== null) globalCount++;
+          localCount++;
+        } catch (error: any) {
+          console.error(`Error processing image ${imageUrl}:`, error.message);
+          results.push({
+            original: imageUrl,
+            error: error.message,
+            success: false
+          });
+        }
+      }
+
+      res.json({ results });
+    } finally {
+      unlock!();
+    }
   });
 
   // Vite middleware for development
