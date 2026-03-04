@@ -157,12 +157,34 @@ const DEFAULT_PROMPTS: Prompt[] = [
   }
 ];
 
+interface ImageStandards {
+  width: number;
+  format: 'image/jpeg' | 'image/png' | 'image/webp';
+  quality: number;
+  prefix: string;
+}
+
 export default function App() {
   const [view, setView] = useState<'dashboard' | 'library' | 'settings'>('dashboard');
   const [urlInput, setUrlInput] = useState('');
   const [proxyUrl, setProxyUrl] = useState('');
   const [testResult, setTestResult] = useState<any>(null);
   const [isTesting, setIsTesting] = useState(false);
+  
+  // --- Folder Monitoring State ---
+  const [isMonitoring, setIsMonitoring] = useState(false);
+  const [imageStandards, setImageStandards] = useState<ImageStandards>(() => {
+    const saved = localStorage.getItem('article_flow_image_standards');
+    return saved ? JSON.parse(saved) : {
+      width: 500,
+      format: 'image/jpeg',
+      quality: 0.8,
+      prefix: 'img_'
+    };
+  });
+  const [processedFileNames, setProcessedFileNames] = useState<Set<string>>(new Set());
+  const [monitorCounter, setMonitorCounter] = useState(1);
+  const monitorIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [prompts, setPrompts] = useState<Prompt[]>(() => {
     const saved = localStorage.getItem('article_flow_prompts_v2');
     return saved ? JSON.parse(saved) : DEFAULT_PROMPTS;
@@ -194,6 +216,112 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('article_flow_image_save_path', imageSavePath);
   }, [imageSavePath]);
+
+  useEffect(() => {
+    localStorage.setItem('article_flow_image_standards', JSON.stringify(imageStandards));
+  }, [imageStandards]);
+
+  // --- Image Processing Utility ---
+  const processImageClientSide = async (file: File, standards: ImageStandards): Promise<Blob> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return reject(new Error('Canvas context failed'));
+
+        const scale = standards.width / img.width;
+        canvas.width = standards.width;
+        canvas.height = img.height * scale;
+
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(
+          (blob) => {
+            if (blob) resolve(blob);
+            else reject(new Error('Blob conversion failed'));
+          },
+          standards.format,
+          standards.quality
+        );
+      };
+      img.onerror = reject;
+      img.src = URL.createObjectURL(file);
+    });
+  };
+
+  // --- Folder Monitoring Logic ---
+  const scanAndProcessFolder = async () => {
+    if (!nativeFolderHandle || !isMonitoring) return;
+
+    try {
+      let currentCounter = monitorCounter;
+      const processedInThisBatch: string[] = [];
+
+      // Create 'processed' subfolder if it doesn't exist
+      let outputFolder: any;
+      try {
+        outputFolder = await nativeFolderHandle.getDirectoryHandle('processed', { create: true });
+      } catch (e) {
+        console.error('Failed to create/get processed folder', e);
+        return;
+      }
+
+      for await (const [name, handle] of (nativeFolderHandle as any).entries()) {
+        if (handle.kind === 'file' && !processedFileNames.has(name) && name !== '.DS_Store') {
+          const isImage = /\.(jpg|jpeg|png|webp|gif|bmp)$/i.test(name);
+          if (isImage) {
+            try {
+              const file = await handle.getFile();
+              const processedBlob = await processImageClientSide(file, imageStandards);
+              
+              const extension = imageStandards.format.split('/')[1];
+              const newName = `${imageStandards.prefix}${String(currentCounter).padStart(3, '0')}.${extension}`;
+              
+              const fileHandle = await outputFolder.getFileHandle(newName, { create: true });
+              const writable = await fileHandle.createWritable();
+              await writable.write(processedBlob);
+              await writable.close();
+
+              processedInThisBatch.push(name);
+              currentCounter++;
+              
+              updateRobot('processing', `监控中: 已处理新图片 ${name} -> ${newName}`);
+            } catch (err) {
+              console.error(`Failed to process ${name}`, err);
+            }
+          }
+        }
+      }
+
+      if (processedInThisBatch.length > 0) {
+        setProcessedFileNames(prev => {
+          const next = new Set(prev);
+          processedInThisBatch.forEach(n => next.add(n));
+          return next;
+        });
+        setMonitorCounter(currentCounter);
+      }
+    } catch (err) {
+      console.error('Folder monitoring error', err);
+    }
+  };
+
+  useEffect(() => {
+    if (isMonitoring && nativeFolderHandle) {
+      updateRobot('success', '文件夹监控已启动');
+      monitorIntervalRef.current = setInterval(scanAndProcessFolder, 3000);
+      // Initial scan
+      scanAndProcessFolder();
+    } else {
+      if (monitorIntervalRef.current) {
+        clearInterval(monitorIntervalRef.current);
+        monitorIntervalRef.current = null;
+      }
+    }
+    return () => {
+      if (monitorIntervalRef.current) clearInterval(monitorIntervalRef.current);
+    };
+  }, [isMonitoring, nativeFolderHandle, imageStandards]);
 
   useEffect(() => {
     // Fetch initial proxy config
@@ -530,15 +658,33 @@ export default function App() {
                 <div className="space-y-2">
                   <div className="flex items-center justify-between px-1">
                     <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-widest flex items-center gap-1">
-                      <Folder size={10} /> 本地保存路径 (原生弹窗)
+                      <RefreshCw size={10} className={isMonitoring ? 'animate-spin' : ''} /> 监控文件夹 (实时处理)
                     </span>
+                    <div className="flex items-center gap-2">
+                      <button 
+                        onClick={scanAndProcessFolder}
+                        disabled={!nativeFolderHandle || isMonitoring}
+                        className="p-1 text-neutral-400 hover:text-emerald-500 transition-colors disabled:opacity-30"
+                        title="立即扫描并处理"
+                      >
+                        <Play size={10} />
+                      </button>
+                      <span className="text-[10px] font-bold text-neutral-400">{isMonitoring ? '监控中' : '已停止'}</span>
+                      <button 
+                        onClick={() => setIsMonitoring(!isMonitoring)}
+                        disabled={!nativeFolderHandle}
+                        className={`w-8 h-4 rounded-full transition-all relative ${isMonitoring ? 'bg-emerald-500' : 'bg-neutral-300'}`}
+                      >
+                        <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all ${isMonitoring ? 'left-4.5' : 'left-0.5'}`} />
+                      </button>
+                    </div>
                   </div>
                   <div className="flex gap-2">
                     <div className="flex-1 px-3 py-2 text-xs rounded-xl border border-neutral-200 bg-white truncate">
                       {nativeFolderHandle ? (
-                        <span className="text-emerald-600 font-bold">已选择: {nativeFolderHandle.name}</span>
+                        <span className="text-emerald-600 font-bold">监控: {nativeFolderHandle.name}</span>
                       ) : (
-                        <span className="text-neutral-400">未选择文件夹</span>
+                        <span className="text-neutral-400">未选择监控文件夹</span>
                       )}
                     </div>
                     <button 
@@ -546,6 +692,8 @@ export default function App() {
                         try {
                           const handle = await (window as any).showDirectoryPicker();
                           setNativeFolderHandle(handle);
+                          setProcessedFileNames(new Set());
+                          setMonitorCounter(1);
                         } catch (err) {
                           console.error('Picker cancelled or failed', err);
                         }
@@ -555,7 +703,9 @@ export default function App() {
                       <Folder size={14} /> 选择
                     </button>
                   </div>
-                  <p className="text-[9px] text-neutral-400 px-1">处理完成后图片将自动保存至该文件夹</p>
+                  <p className="text-[9px] text-neutral-400 px-1">
+                    开启监控后，放入文件夹的图片将自动转换为 {imageStandards.width}px {imageStandards.format.split('/')[1]} 格式并重命名。
+                  </p>
                 </div>
 
                 <textarea 
@@ -1132,6 +1282,58 @@ export default function App() {
                   animate={{ opacity: 1, x: 0 }}
                   className="space-y-6"
                 >
+                  <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6 hover:shadow-md transition-shadow">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 bg-indigo-100 text-indigo-600 rounded-xl flex items-center justify-center">
+                        <ImageIcon size={20} />
+                      </div>
+                      <h3 className="font-bold text-xl">图片处理标准</h3>
+                    </div>
+
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <label className="text-sm font-bold text-neutral-600">目标宽度 (px)</label>
+                        <input 
+                          type="number"
+                          value={imageStandards.width}
+                          onChange={(e) => setImageStandards({ ...imageStandards, width: parseInt(e.target.value) || 500 })}
+                          className="w-full px-4 py-3 rounded-2xl border border-neutral-200 focus:border-emerald-500 outline-none transition-all"
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-sm font-bold text-neutral-600">输出格式</label>
+                        <select 
+                          value={imageStandards.format}
+                          onChange={(e) => setImageStandards({ ...imageStandards, format: e.target.value as any })}
+                          className="w-full px-4 py-3 rounded-2xl border border-neutral-200 focus:border-emerald-500 outline-none transition-all bg-white"
+                        >
+                          <option value="image/jpeg">JPG</option>
+                          <option value="image/png">PNG</option>
+                          <option value="image/webp">WebP</option>
+                        </select>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-sm font-bold text-neutral-600">重命名命名前缀</label>
+                        <input 
+                          type="text"
+                          value={imageStandards.prefix}
+                          onChange={(e) => setImageStandards({ ...imageStandards, prefix: e.target.value })}
+                          className="w-full px-4 py-3 rounded-2xl border border-neutral-200 focus:border-emerald-500 outline-none transition-all"
+                          placeholder="例如: img_"
+                        />
+                      </div>
+
+                      <div className="p-4 bg-indigo-50 rounded-2xl border border-indigo-100">
+                        <p className="text-xs text-indigo-600 leading-relaxed">
+                          <span className="font-bold">监控逻辑：</span>
+                          系统将监控根目录下的新图片，处理后的图片将存放在 <code className="bg-indigo-100 px-1 rounded">/processed</code> 子目录中，以防循环处理。
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6 hover:shadow-md transition-shadow">
                     <div className="flex items-center gap-3">
                       <div className="w-10 h-10 bg-blue-100 text-blue-600 rounded-xl flex items-center justify-center">
