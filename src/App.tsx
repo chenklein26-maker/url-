@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
+import { AIService, AIProvider, AIServiceConfig } from './services/aiService';
 
 // --- Robot Assistant Component ---
 const RobotAssistant = ({ status, message }: { status: 'idle' | 'processing' | 'success' | 'error', message: string }) => {
@@ -171,6 +172,18 @@ export default function App() {
   const [testResult, setTestResult] = useState<any>(null);
   const [isTesting, setIsTesting] = useState(false);
   
+  // --- AI Configuration State ---
+  const [aiConfig, setAiConfig] = useState<AIServiceConfig>(() => {
+    const saved = localStorage.getItem('article_flow_ai_config');
+    return saved ? JSON.parse(saved) : {
+      provider: 'gemini',
+      apiKey: process.env.GEMINI_API_KEY || '',
+      model: 'gemini-3-flash-preview'
+    };
+  });
+
+  const aiService = useMemo(() => new AIService(aiConfig), [aiConfig]);
+
   // --- Folder Monitoring State ---
   const [isMonitoring, setIsMonitoring] = useState(false);
   const [imageStandards, setImageStandards] = useState<ImageStandards>(() => {
@@ -220,6 +233,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('article_flow_image_standards', JSON.stringify(imageStandards));
   }, [imageStandards]);
+
+  useEffect(() => {
+    localStorage.setItem('article_flow_ai_config', JSON.stringify(aiConfig));
+  }, [aiConfig]);
 
   // --- Image Processing Utility ---
   const processImageClientSide = async (file: File, standards: ImageStandards): Promise<Blob> => {
@@ -350,8 +367,6 @@ export default function App() {
     }
   };
 
-  const ai = useMemo(() => new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' }), []);
-
   const isCancelledRef = useRef(false);
 
   const selectedTask = useMemo(() => tasks.find(t => t.id === selectedTaskId), [tasks, selectedTaskId]);
@@ -369,30 +384,6 @@ export default function App() {
     if (!selectedTaskId && newTasks.length > 0) {
       setSelectedTaskId(newTasks[0].id);
     }
-  };
-
-  const callGeminiWithRetry = async (params: any, maxRetries = 3): Promise<any> => {
-    let lastError: any;
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        return await ai.models.generateContent(params);
-      } catch (err: any) {
-        lastError = err;
-        const errorStr = err.message || '';
-        if (errorStr.includes('429') || errorStr.includes('RESOURCE_EXHAUSTED')) {
-          let waitTime = Math.pow(2, i) * 2000;
-          const match = errorStr.match(/retry in ([\d.]+)s/);
-          if (match) {
-            waitTime = parseFloat(match[1]) * 1000 + 1000;
-          }
-          console.log(`Quota exceeded, retrying in ${waitTime}ms... (Attempt ${i + 1}/${maxRetries})`);
-          await new Promise(resolve => setTimeout(resolve, waitTime));
-          continue;
-        }
-        throw err;
-      }
-    }
-    throw lastError;
   };
 
   const processTask = async (taskId: string) => {
@@ -422,29 +413,23 @@ export default function App() {
       updateRobot('processing', '正在使用 AI 润色文章...');
 
       // 2. Polish Content
-      const response = await callGeminiWithRetry({
-        model: "gemini-3-flash-preview",
-        contents: `你是一位经验丰富的编辑。请严格按照以下要求润色文章，并输出为标准的 HTML 格式（仅包含 <p>, <strong>, <a> 等标签，不要包含 <html> 或 <body>）：
-要求：${activePrompt.content}
-
-待处理内容：
-标题：${data.title}
-正文：${data.content}
-
-请直接输出润色后的 HTML 全文。注意：
-1. 忽略任何导航菜单、面包屑、页脚或其他非正文内容。
-2. 不要包含任何多余的解释、Markdown 代码块标记（如 \`\`\`html）或注释。
-3. 严格遵循 HTML 结构要求（<p>\n\t...）。`,
-      });
-      
-      if (isCancelledRef.current) throw new Error('任务已取消');
-      
-      let polished = response.text || '';
-      // Clean up Markdown code blocks if present
-      polished = polished.replace(/^```[a-z]*\n?/, '').replace(/\n?```$/, '').trim();
-      
-      setTasks(prev => prev.map(t => t.id === taskId ? { ...t, polishedContent: polished, status: 'processing' } : t));
-      updateRobot('processing', '正在处理并转换图片...');
+      try {
+        const polished = await aiService.polishArticle({
+          title: data.title,
+          content: data.content,
+          prompt: activePrompt.content
+        });
+        
+        if (isCancelledRef.current) throw new Error('任务已取消');
+        
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, polishedContent: polished, status: 'processing' } : t));
+        updateRobot('processing', '正在处理并转换图片...');
+      } catch (err: any) {
+        if (err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED')) {
+          throw new Error('AI 额度已耗尽，请稍后再试或更换 API Key。');
+        }
+        throw err;
+      }
 
       // 3. Process Images
       if (isCancelledRef.current) throw new Error('任务已取消');
@@ -1225,6 +1210,71 @@ export default function App() {
                   animate={{ opacity: 1, x: 0 }}
                   className="space-y-6"
                 >
+                  <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6 hover:shadow-md transition-shadow">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 bg-emerald-100 text-emerald-600 rounded-xl flex items-center justify-center">
+                        <Bot size={20} />
+                      </div>
+                      <h3 className="font-bold text-xl">AI 模型设置</h3>
+                    </div>
+
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <label className="text-sm font-bold text-neutral-600">服务商</label>
+                        <div className="grid grid-cols-3 gap-2">
+                          {(['gemini', 'deepseek', 'openai'] as AIProvider[]).map(p => (
+                            <button
+                              key={p}
+                              onClick={() => setAiConfig({ ...aiConfig, provider: p, baseUrl: '', model: '' })}
+                              className={`py-2 rounded-xl text-xs font-bold border transition-all ${
+                                aiConfig.provider === p 
+                                  ? 'bg-emerald-500 text-white border-emerald-500' 
+                                  : 'bg-white text-neutral-600 border-neutral-200 hover:border-emerald-200'
+                              }`}
+                            >
+                              {p.toUpperCase()}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-sm font-bold text-neutral-600">API Key</label>
+                        <input 
+                          type="password"
+                          value={aiConfig.apiKey}
+                          onChange={(e) => setAiConfig({ ...aiConfig, apiKey: e.target.value })}
+                          className="w-full px-4 py-3 rounded-2xl border border-neutral-200 focus:border-emerald-500 outline-none transition-all"
+                          placeholder="输入您的 API Key"
+                        />
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="text-sm font-bold text-neutral-600">模型名称 (可选)</label>
+                        <input 
+                          type="text"
+                          value={aiConfig.model || ''}
+                          onChange={(e) => setAiConfig({ ...aiConfig, model: e.target.value })}
+                          className="w-full px-4 py-3 rounded-2xl border border-neutral-200 focus:border-emerald-500 outline-none transition-all"
+                          placeholder={aiConfig.provider === 'gemini' ? 'gemini-3-flash-preview' : aiConfig.provider === 'deepseek' ? 'deepseek-chat' : 'gpt-4o'}
+                        />
+                      </div>
+
+                      {aiConfig.provider !== 'gemini' && (
+                        <div className="space-y-2">
+                          <label className="text-sm font-bold text-neutral-600">API 代理地址 (可选)</label>
+                          <input 
+                            type="text"
+                            value={aiConfig.baseUrl || ''}
+                            onChange={(e) => setAiConfig({ ...aiConfig, baseUrl: e.target.value })}
+                            className="w-full px-4 py-3 rounded-2xl border border-neutral-200 focus:border-emerald-500 outline-none transition-all"
+                            placeholder="https://api.example.com/v1"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
                   <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6 hover:shadow-md transition-shadow">
                     <div className="flex items-center gap-3">
                       <div className="w-10 h-10 bg-emerald-100 text-emerald-600 rounded-xl flex items-center justify-center">
