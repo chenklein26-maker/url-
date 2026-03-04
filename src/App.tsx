@@ -29,7 +29,10 @@ import ReactMarkdown from 'react-markdown';
 interface ProcessedImage {
   original: string;
   processed: string;
+  filename: string;
   success: boolean;
+  localPath?: string;
+  savedToNative?: boolean;
   error?: string;
 }
 
@@ -91,8 +94,11 @@ const DEFAULT_PROMPTS: Prompt[] = [
 ];
 
 export default function App() {
-  const [view, setView] = useState<'dashboard' | 'library'>('dashboard');
+  const [view, setView] = useState<'dashboard' | 'library' | 'settings'>('dashboard');
   const [urlInput, setUrlInput] = useState('');
+  const [proxyUrl, setProxyUrl] = useState('');
+  const [testResult, setTestResult] = useState<any>(null);
+  const [isTesting, setIsTesting] = useState(false);
   const [prompts, setPrompts] = useState<Prompt[]>(() => {
     const saved = localStorage.getItem('article_flow_prompts_v2');
     return saved ? JSON.parse(saved) : DEFAULT_PROMPTS;
@@ -124,6 +130,16 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('article_flow_image_save_path', imageSavePath);
   }, [imageSavePath]);
+
+  useEffect(() => {
+    // Fetch initial proxy config
+    fetch('/api/config/proxy')
+      .then(res => res.json())
+      .then(data => {
+        if (data.proxyUrl) setProxyUrl(data.proxyUrl);
+      })
+      .catch(err => console.error('Failed to fetch proxy config', err));
+  }, []);
 
   const [tasks, setTasks] = useState<Task[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -218,16 +234,17 @@ export default function App() {
         body: JSON.stringify({ 
           images: data.images, 
           taskId: taskId,
-          imageSavePath: imageSavePath // Pass the custom path to backend
+          imageSavePath: imageSavePath
         })
       });
       
       if (!imageRes.ok) throw new Error('图片处理失败。');
       const imageData = await imageRes.json();
+      const results = imageData.results || [];
       
       // If native folder is selected, save images to it
-      if (nativeFolderHandle && imageData.results) {
-        for (const img of imageData.results) {
+      if (nativeFolderHandle && results.length > 0) {
+        for (const img of results) {
           if (img.success && img.processed) {
             try {
               const res = await fetch(img.processed);
@@ -236,6 +253,7 @@ export default function App() {
               const writable = await fileHandle.createWritable();
               await writable.write(blob);
               await writable.close();
+              img.savedToNative = true;
             } catch (err) {
               console.error(`Failed to save ${img.filename} to native folder:`, err);
             }
@@ -243,7 +261,7 @@ export default function App() {
         }
       }
 
-      setTasks(prev => prev.map(t => t.id === taskId ? { ...t, processedImages: imageData.results, status: 'done' } : t));
+      setTasks(prev => prev.map(t => t.id === taskId ? { ...t, processedImages: results, status: 'done' } : t));
 
     } catch (err: any) {
       let errorMessage = err.message || '未知错误';
@@ -290,6 +308,33 @@ export default function App() {
     if (activePromptId === id) setActivePromptId(prompts.find(p => p.id !== id)!.id);
   };
 
+  const handleSaveProxy = async () => {
+    try {
+      await fetch('/api/config/proxy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: proxyUrl })
+      });
+      alert('代理设置已保存');
+    } catch (err) {
+      alert('保存失败');
+    }
+  };
+
+  const handleTestConnection = async () => {
+    setIsTesting(true);
+    setTestResult(null);
+    try {
+      const res = await fetch('/api/test-connection');
+      const data = await res.json();
+      setTestResult(data);
+    } catch (err: any) {
+      setTestResult({ success: false, error: err.message });
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
   return (
     <div className="flex h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans overflow-hidden">
       {/* Sidebar - Navigation & Task List */}
@@ -318,6 +363,14 @@ export default function App() {
               }`}
             >
               <Wand2 size={14} /> 提示词库
+            </button>
+            <button 
+              onClick={() => setView('settings')}
+              className={`flex-1 flex items-center justify-center gap-2 py-2 text-xs font-bold rounded-lg transition-all ${
+                view === 'settings' ? 'bg-white text-emerald-600 shadow-sm' : 'text-neutral-500 hover:text-neutral-700'
+              }`}
+            >
+              <Search size={14} /> 网络设置
             </button>
           </nav>
           
@@ -406,7 +459,7 @@ export default function App() {
               </div>
             </div>
           </>
-        ) : (
+        ) : view === 'library' ? (
           <div className="flex-1 p-6 space-y-4">
             <div className="flex items-center justify-between px-2 mb-2">
               <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-widest">我的提示词</span>
@@ -452,6 +505,82 @@ export default function App() {
               ))}
             </div>
           </div>
+        ) : (
+          <div className="flex-1 p-6 space-y-6">
+            <div className="space-y-4">
+              <div className="px-2">
+                <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-widest">代理配置</span>
+              </div>
+              <div className="p-4 bg-neutral-50 rounded-2xl border border-black/5 space-y-4">
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-neutral-600">HTTP/HTTPS 代理地址</label>
+                  <input 
+                    type="text"
+                    placeholder="例如: http://127.0.0.1:7890"
+                    value={proxyUrl}
+                    onChange={(e) => setProxyUrl(e.target.value)}
+                    className="w-full px-3 py-2 text-sm rounded-xl border border-neutral-200 focus:border-emerald-500 outline-none transition-all bg-white"
+                  />
+                  <p className="text-[10px] text-neutral-400">配置后，程序后台抓取文章和图片将通过此代理。如果您的 VPN 无法被程序识别，请在此手动输入代理地址。</p>
+                </div>
+                <button 
+                  onClick={handleSaveProxy}
+                  className="w-full bg-black text-white py-2 rounded-xl text-sm font-semibold hover:bg-neutral-800 transition-all"
+                >
+                  保存代理设置
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <div className="px-2">
+                <span className="text-[10px] font-bold text-neutral-400 uppercase tracking-widest">网络连通性测试</span>
+              </div>
+              <div className="p-4 bg-neutral-50 rounded-2xl border border-black/5 space-y-4">
+                <button 
+                  onClick={handleTestConnection}
+                  disabled={isTesting}
+                  className="w-full border border-emerald-500 text-emerald-600 py-2 rounded-xl text-sm font-semibold hover:bg-emerald-50 transition-all flex items-center justify-center gap-2"
+                >
+                  {isTesting ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
+                  测试当前网络环境 (VPN)
+                </button>
+
+                {testResult && (
+                  <div className={`p-4 rounded-xl border ${testResult.success ? 'bg-emerald-50 border-emerald-100' : 'bg-red-50 border-red-100'}`}>
+                    {testResult.success ? (
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2 text-emerald-600 font-bold text-sm">
+                          <CheckCircle2 size={16} /> 连接成功
+                        </div>
+                        <div className="grid grid-cols-2 gap-y-2 text-[11px]">
+                          <span className="text-neutral-500">出口 IP:</span>
+                          <span className="font-mono font-bold text-neutral-700">{testResult.ip}</span>
+                          <span className="text-neutral-500">地理位置:</span>
+                          <span className="font-bold text-neutral-700">{testResult.location}</span>
+                          <span className="text-neutral-500">运营商:</span>
+                          <span className="font-bold text-neutral-700">{testResult.isp}</span>
+                          <span className="text-neutral-500">延迟:</span>
+                          <span className="font-bold text-neutral-700">{testResult.latency}</span>
+                          <span className="text-neutral-500">代理状态:</span>
+                          <span className={`font-bold ${testResult.proxyActive ? 'text-emerald-600' : 'text-neutral-400'}`}>
+                            {testResult.proxyActive ? '已启用' : '未启用'}
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2 text-red-600 font-bold text-sm">
+                          <AlertCircle size={16} /> 连接失败
+                        </div>
+                        <p className="text-[11px] text-red-500">{testResult.error}</p>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
         )}
       </aside>
 
@@ -474,7 +603,7 @@ export default function App() {
                 切换提示词 <ChevronRight size={14} />
               </button>
             </header>
-
+            
             {/* Content Area */}
             <div className="flex-1 overflow-y-auto p-8 bg-neutral-50/50">
               <AnimatePresence mode="wait">
@@ -571,10 +700,22 @@ export default function App() {
                                         </a>
                                       </div>
                                       <div className="p-3 bg-white border-t border-black/5 flex items-center justify-between">
-                                        <span className="text-[10px] font-mono text-neutral-400 truncate max-w-[120px]">
-                                          {img.original.split('/').pop()}
-                                        </span>
-                                        <span className="text-[10px] font-bold text-emerald-500 uppercase tracking-wider">500px JPG</span>
+                                        <div className="flex flex-col">
+                                          <span className="text-[10px] font-mono text-neutral-400 truncate max-w-[120px]">
+                                            {img.filename}
+                                          </span>
+                                          {img.savedToNative && (
+                                            <span className="text-[9px] text-emerald-500 font-bold flex items-center gap-0.5">
+                                              <CheckCircle2 size={8} /> 已自动存入本地
+                                            </span>
+                                          )}
+                                          {img.localPath && (
+                                            <span className="text-[9px] text-blue-500 font-bold flex items-center gap-0.5" title={img.localPath}>
+                                              <CheckCircle2 size={8} /> 已存至伺服器路徑
+                                            </span>
+                                          )}
+                                        </div>
+                                        <span className="text-[10px] font-bold text-emerald-500 uppercase tracking-wider">JPG</span>
                                       </div>
                                     </>
                                   ) : (
@@ -704,7 +845,7 @@ export default function App() {
               </AnimatePresence>
             </div>
           </>
-        ) : (
+        ) : view === 'library' ? (
           <div className="flex-1 overflow-y-auto p-12">
             <div className="max-w-4xl mx-auto space-y-12">
               <div className="space-y-2">
@@ -770,6 +911,117 @@ export default function App() {
                   </div>
                   <span className="font-bold">添加新提示词</span>
                 </button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 overflow-y-auto p-12">
+            <div className="max-w-4xl mx-auto space-y-12">
+              <div className="space-y-2">
+                <h2 className="text-4xl font-bold tracking-tight">网络设置</h2>
+                <p className="text-neutral-500 text-lg">配置代理服务器以解决网络连接问题，并测试 VPN 是否生效。</p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div className="space-y-6">
+                  <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 bg-emerald-100 text-emerald-600 rounded-xl flex items-center justify-center">
+                        <Search size={20} />
+                      </div>
+                      <h3 className="font-bold text-xl">代理配置</h3>
+                    </div>
+                    
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <label className="text-sm font-bold text-neutral-600">HTTP/HTTPS 代理地址</label>
+                        <input 
+                          type="text"
+                          placeholder="例如: http://127.0.0.1:7890"
+                          value={proxyUrl}
+                          onChange={(e) => setProxyUrl(e.target.value)}
+                          className="w-full px-4 py-3 rounded-2xl border border-neutral-200 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10 outline-none transition-all"
+                        />
+                      </div>
+                      <button 
+                        onClick={handleSaveProxy}
+                        className="w-full bg-black text-white py-3.5 rounded-2xl font-bold hover:bg-neutral-800 transition-all shadow-lg shadow-black/10"
+                      >
+                        应用代理设置
+                      </button>
+                    </div>
+                    
+                    <div className="p-4 bg-neutral-50 rounded-2xl border border-black/5">
+                      <p className="text-xs text-neutral-500 leading-relaxed">
+                        <span className="font-bold text-neutral-700">提示：</span>
+                        如果您的 VPN 无法被程序自动识别，请在此手动输入代理地址。
+                        通常 Clash 的默认代理地址为 <code className="bg-neutral-200 px-1 rounded">http://127.0.0.1:7890</code>。
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-6">
+                  <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 bg-blue-100 text-blue-600 rounded-xl flex items-center justify-center">
+                        <RefreshCw size={20} />
+                      </div>
+                      <h3 className="font-bold text-xl">连通性测试</h3>
+                    </div>
+
+                    <button 
+                      onClick={handleTestConnection}
+                      disabled={isTesting}
+                      className="w-full border-2 border-emerald-500 text-emerald-600 py-3.5 rounded-2xl font-bold hover:bg-emerald-50 transition-all flex items-center justify-center gap-2"
+                    >
+                      {isTesting ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} />}
+                      立即测试 VPN 状态
+                    </button>
+
+                    {testResult && (
+                      <motion.div 
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className={`p-6 rounded-3xl border ${testResult.success ? 'bg-emerald-50/50 border-emerald-100' : 'bg-red-50 border-red-100'}`}
+                      >
+                        {testResult.success ? (
+                          <div className="space-y-4">
+                            <div className="flex items-center gap-2 text-emerald-600 font-bold">
+                              <CheckCircle2 size={20} /> 网络连接正常
+                            </div>
+                            <div className="space-y-3">
+                              <div className="flex justify-between items-center border-b border-emerald-100 pb-2">
+                                <span className="text-xs text-neutral-500">出口 IP</span>
+                                <span className="text-sm font-mono font-bold text-neutral-700">{testResult.ip}</span>
+                              </div>
+                              <div className="flex justify-between items-center border-b border-emerald-100 pb-2">
+                                <span className="text-xs text-neutral-500">地理位置</span>
+                                <span className="text-sm font-bold text-neutral-700">{testResult.location}</span>
+                              </div>
+                              <div className="flex justify-between items-center border-b border-emerald-100 pb-2">
+                                <span className="text-xs text-neutral-500">运营商</span>
+                                <span className="text-sm font-bold text-neutral-700">{testResult.isp}</span>
+                              </div>
+                              <div className="flex justify-between items-center">
+                                <span className="text-xs text-neutral-500">延迟</span>
+                                <span className="text-sm font-bold text-neutral-700">{testResult.latency}</span>
+                              </div>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="space-y-3">
+                            <div className="flex items-center gap-2 text-red-600 font-bold">
+                              <AlertCircle size={20} /> 连接失败
+                            </div>
+                            <p className="text-xs text-red-500 leading-relaxed">{testResult.error}</p>
+                            <p className="text-[10px] text-neutral-400">请检查您的代理地址是否正确，或者 VPN 是否已开启。</p>
+                          </div>
+                        )}
+                      </motion.div>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           </div>

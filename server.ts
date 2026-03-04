@@ -4,13 +4,38 @@ import axios from "axios";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import sharp from "sharp";
+import iconv from "iconv-lite";
+import jschardet from "jschardet";
 import path from "path";
 import fs from "fs";
 import cors from "cors";
 import { fileURLToPath } from "url";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Global proxy configuration
+let proxyUrl: string | null = null;
+
+function getAxiosConfig(url: string) {
+  const config: any = {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Referer': new URL(url).origin
+    },
+    timeout: 15000
+  };
+
+  if (proxyUrl) {
+    config.httpsAgent = new HttpsProxyAgent(proxyUrl);
+    config.proxy = false; // Disable default axios proxy handling to use the agent
+  }
+
+  return config;
+}
 
 // Simple lock for sequential image processing to avoid race conditions in naming
 let imageProcessingLock = Promise.resolve();
@@ -35,6 +60,46 @@ async function startServer() {
   // Serve static files from public
   app.use('/processed', express.static(processedDir));
 
+  // API: Set/Get Proxy
+  app.post("/api/config/proxy", (req, res) => {
+    const { url } = req.body;
+    proxyUrl = url || null;
+    res.json({ success: true, proxyUrl });
+  });
+
+  app.get("/api/config/proxy", (req, res) => {
+    res.json({ proxyUrl });
+  });
+
+  // API: Test Proxy / VPN
+  app.get("/api/test-connection", async (req, res) => {
+    try {
+      const startTime = Date.now();
+      const config = getAxiosConfig("https://www.google.com");
+      
+      // Try to get IP info from a public API
+      const ipRes = await axios.get("https://api.ipify.org?format=json", config);
+      const geoRes = await axios.get(`https://ipapi.co/${ipRes.data.ip}/json/`, config);
+      
+      const duration = Date.now() - startTime;
+      
+      res.json({
+        success: true,
+        ip: ipRes.data.ip,
+        location: `${geoRes.data.city}, ${geoRes.data.country_name}`,
+        isp: geoRes.data.org,
+        latency: `${duration}ms`,
+        proxyActive: !!proxyUrl
+      });
+    } catch (error: any) {
+      res.status(500).json({ 
+        success: false, 
+        error: error.message,
+        proxyActive: !!proxyUrl
+      });
+    }
+  });
+
   // API: Extract article and image URLs
   app.post("/api/extract", async (req, res) => {
     const { url } = req.body;
@@ -42,11 +107,17 @@ async function startServer() {
 
     try {
       const response = await axios.get(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
+        ...getAxiosConfig(url),
+        responseType: 'arraybuffer'
       });
-      const dom = new JSDOM(response.data, { url });
+
+      // Detect and decode encoding
+      const buffer = Buffer.from(response.data);
+      const detection = jschardet.detect(buffer);
+      const encoding = detection.encoding || 'utf-8';
+      const html = iconv.decode(buffer, encoding);
+
+      const dom = new JSDOM(html, { url });
       const reader = new Readability(dom.window.document);
       const article = reader.parse();
 
@@ -58,8 +129,13 @@ async function startServer() {
       const contentDom = new JSDOM(article.content);
       const images = Array.from(contentDom.window.document.querySelectorAll('img'))
         .map(img => {
-          const src = img.getAttribute('src');
+          // Support common lazy load attributes
+          const src = img.getAttribute('data-src') || img.getAttribute('src') || img.getAttribute('data-original');
           if (!src) return null;
+          
+          // Filter out very small icons or data URIs if needed
+          if (src.startsWith('data:')) return null;
+          
           try {
             return new URL(src, url).href;
           } catch {
@@ -125,11 +201,8 @@ async function startServer() {
       for (const imageUrl of images) {
         try {
           const response = await axios.get(imageUrl, { 
-            responseType: 'arraybuffer',
-            timeout: 10000,
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
+            ...getAxiosConfig(imageUrl),
+            responseType: 'arraybuffer'
           });
           const buffer = Buffer.from(response.data);
           
@@ -143,7 +216,8 @@ async function startServer() {
 
           results.push({
             original: imageUrl,
-            processed: useFlatStructure ? `file://${outputPath}` : `/processed/${taskId}/${filename}`,
+            processed: `/processed/${taskId}/${filename}`,
+            localPath: useFlatStructure ? outputPath : null,
             filename: filename,
             success: true
           });
