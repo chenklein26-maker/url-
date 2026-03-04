@@ -26,12 +26,12 @@ function getAxiosConfig(url: string) {
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       'Referer': new URL(url).origin
     },
-    timeout: 15000
+    timeout: 15000,
+    proxy: false // Explicitly disable default proxy to avoid picking up environment variables like 127.0.0.1:10809
   };
 
   if (proxyUrl) {
     config.httpsAgent = new HttpsProxyAgent(proxyUrl);
-    config.proxy = false; // Disable default axios proxy handling to use the agent
   }
 
   return config;

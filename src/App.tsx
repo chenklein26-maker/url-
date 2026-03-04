@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { GoogleGenAI, Type } from "@google/genai";
 import { 
   Link as LinkIcon, 
@@ -21,10 +21,74 @@ import {
   Folder,
   ChevronLeft,
   Search,
-  X
+  X,
+  Bot,
+  MessageSquare
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import ReactMarkdown from 'react-markdown';
+
+// --- Robot Assistant Component ---
+const RobotAssistant = ({ status, message }: { status: 'idle' | 'processing' | 'success' | 'error', message: string }) => {
+  return (
+    <motion.div 
+      initial={{ opacity: 0, y: 20, scale: 0.8 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      className="fixed bottom-6 right-6 z-50 flex flex-col items-end gap-3 pointer-events-none"
+    >
+      <AnimatePresence mode="wait">
+        {message && (
+          <motion.div
+            key={message}
+            initial={{ opacity: 0, x: 20, scale: 0.9 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: 10, scale: 0.9 }}
+            className="bg-white/90 backdrop-blur-md border border-emerald-100 px-4 py-2.5 rounded-2xl rounded-br-none shadow-xl shadow-emerald-500/10 max-w-[240px]"
+          >
+            <p className="text-[13px] font-medium text-neutral-800 leading-relaxed">
+              {message}
+            </p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      
+      <div className="relative">
+        <motion.div 
+          animate={status === 'processing' ? {
+            scale: [1, 1.1, 1],
+            rotate: [0, 5, -5, 0]
+          } : {}}
+          transition={{ repeat: Infinity, duration: 2 }}
+          className={`w-14 h-14 rounded-2xl flex items-center justify-center shadow-2xl transition-colors duration-500 ${
+            status === 'processing' ? 'bg-emerald-500' : 
+            status === 'error' ? 'bg-red-500' : 
+            status === 'success' ? 'bg-emerald-600' : 'bg-black'
+          }`}
+        >
+          <Bot size={28} className="text-white" />
+          
+          {/* Status Indicator */}
+          <motion.div 
+            animate={{ scale: [1, 1.2, 1], opacity: [0.5, 1, 0.5] }}
+            transition={{ repeat: Infinity, duration: 1.5 }}
+            className={`absolute -top-1 -right-1 w-4 h-4 rounded-full border-2 border-white ${
+              status === 'processing' ? 'bg-yellow-400' : 
+              status === 'error' ? 'bg-red-400' : 
+              status === 'success' ? 'bg-emerald-400' : 'bg-neutral-400'
+            }`}
+          />
+        </motion.div>
+        
+        {/* Decorative Ring */}
+        <motion.div 
+          animate={status === 'processing' ? { scale: [1, 1.5], opacity: [0.3, 0] } : { opacity: 0 }}
+          transition={{ repeat: Infinity, duration: 1.5 }}
+          className="absolute inset-0 border-2 border-emerald-500 rounded-2xl pointer-events-none"
+        />
+      </div>
+    </motion.div>
+  );
+};
 
 interface ProcessedImage {
   original: string;
@@ -144,8 +208,23 @@ export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [robotStatus, setRobotStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle');
+  const [robotMessage, setRobotMessage] = useState('你好！我是您的内容同步助手。');
+
+  const updateRobot = (status: 'idle' | 'processing' | 'success' | 'error', message: string, duration = 4000) => {
+    setRobotStatus(status);
+    setRobotMessage(message);
+    if (status !== 'processing' && duration > 0) {
+      setTimeout(() => {
+        setRobotStatus('idle');
+        setRobotMessage('准备就绪，随时可以开始。');
+      }, duration);
+    }
+  };
 
   const ai = useMemo(() => new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' }), []);
+
+  const isCancelledRef = useRef(false);
 
   const selectedTask = useMemo(() => tasks.find(t => t.id === selectedTaskId), [tasks, selectedTaskId]);
 
@@ -158,6 +237,7 @@ export default function App() {
     }));
     setTasks(prev => [...prev, ...newTasks]);
     setUrlInput('');
+    updateRobot('success', `成功添加 ${newTasks.length} 个任务！`);
     if (!selectedTaskId && newTasks.length > 0) {
       setSelectedTaskId(newTasks[0].id);
     }
@@ -189,11 +269,16 @@ export default function App() {
 
   const processTask = async (taskId: string) => {
     try {
+      if (isCancelledRef.current) return;
+      
       // 1. Extract Article
       setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'extracting', error: undefined } : t));
+      updateRobot('processing', '正在提取文章内容...');
       
       const task = tasks.find(t => t.id === taskId);
       if (!task) return;
+
+      if (isCancelledRef.current) throw new Error('任务已取消');
 
       const extractRes = await fetch('/api/extract', {
         method: 'POST',
@@ -203,7 +288,10 @@ export default function App() {
       
       if (!extractRes.ok) throw new Error('无法提取文章内容，请检查URL是否正确。');
       const data: ArticleData = await extractRes.json();
+      
+      if (isCancelledRef.current) throw new Error('任务已取消');
       setTasks(prev => prev.map(t => t.id === taskId ? { ...t, articleData: data, status: 'polishing' } : t));
+      updateRobot('processing', '正在使用 AI 润色文章...');
 
       // 2. Polish Content
       const response = await callGeminiWithRetry({
@@ -221,13 +309,18 @@ export default function App() {
 3. 严格遵循 HTML 结构要求（<p>\n\t...）。`,
       });
       
+      if (isCancelledRef.current) throw new Error('任务已取消');
+      
       let polished = response.text || '';
       // Clean up Markdown code blocks if present
       polished = polished.replace(/^```[a-z]*\n?/, '').replace(/\n?```$/, '').trim();
       
       setTasks(prev => prev.map(t => t.id === taskId ? { ...t, polishedContent: polished, status: 'processing' } : t));
+      updateRobot('processing', '正在处理并转换图片...');
 
       // 3. Process Images
+      if (isCancelledRef.current) throw new Error('任务已取消');
+
       const imageRes = await fetch('/api/process-images', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -242,9 +335,12 @@ export default function App() {
       const imageData = await imageRes.json();
       const results = imageData.results || [];
       
+      if (isCancelledRef.current) throw new Error('任务已取消');
+
       // If native folder is selected, save images to it
       if (nativeFolderHandle && results.length > 0) {
         for (const img of results) {
+          if (isCancelledRef.current) throw new Error('任务已取消');
           if (img.success && img.processed) {
             try {
               const res = await fetch(img.processed);
@@ -261,22 +357,39 @@ export default function App() {
         }
       }
 
+      if (isCancelledRef.current) throw new Error('任务已取消');
       setTasks(prev => prev.map(t => t.id === taskId ? { ...t, processedImages: results, status: 'done' } : t));
 
     } catch (err: any) {
+      if (err.message === '任务已取消') {
+        setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'pending', error: undefined } : t));
+        return;
+      }
       let errorMessage = err.message || '未知错误';
       if (errorMessage.includes('429') || errorMessage.includes('RESOURCE_EXHAUSTED')) {
         errorMessage = 'API 调用额度已耗尽或请求过于频繁。系统已尝试自动重试，但仍未成功。请稍等片刻后再试。';
       }
       setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'error', error: errorMessage } : t));
+      updateRobot('error', `处理出错: ${errorMessage.substring(0, 30)}...`);
     }
   };
 
   const handleStartAll = async () => {
+    isCancelledRef.current = false;
     setIsProcessing(true);
+    updateRobot('processing', '开始批量处理任务，请稍候...');
     const pendingTasks = tasks.filter(t => t.status === 'pending' || t.status === 'error');
     await Promise.all(pendingTasks.map(task => processTask(task.id)));
     setIsProcessing(false);
+    if (!isCancelledRef.current) {
+      updateRobot('success', '所有任务处理完成！');
+    }
+  };
+
+  const handleCancelAll = () => {
+    isCancelledRef.current = true;
+    setIsProcessing(false);
+    updateRobot('error', '处理已取消。');
   };
 
   const removeTask = (id: string) => {
@@ -308,16 +421,17 @@ export default function App() {
     if (activePromptId === id) setActivePromptId(prompts.find(p => p.id !== id)!.id);
   };
 
-  const handleSaveProxy = async () => {
+  const handleSaveProxy = async (urlOverride?: string) => {
+    const urlToSave = urlOverride !== undefined ? urlOverride : proxyUrl;
     try {
       await fetch('/api/config/proxy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: proxyUrl })
+        body: JSON.stringify({ url: urlToSave })
       });
-      alert('代理设置已保存');
+      if (urlOverride === undefined) alert('代理设置已保存');
     } catch (err) {
-      alert('保存失败');
+      if (urlOverride === undefined) alert('保存失败');
     }
   };
 
@@ -336,9 +450,15 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans overflow-hidden">
+    <div className="flex h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans overflow-hidden relative">
+      <RobotAssistant status={robotStatus} message={robotMessage} />
+      
       {/* Sidebar - Navigation & Task List */}
-      <aside className="w-80 border-r border-black/5 bg-white flex flex-col shrink-0">
+      <motion.aside 
+        initial={{ x: -20, opacity: 0 }}
+        animate={{ x: 0, opacity: 1 }}
+        className="w-80 border-r border-black/5 bg-white flex flex-col shrink-0"
+      >
         <div className="p-6 border-b border-black/5">
           <div className="flex items-center gap-2 mb-8">
             <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-white">
@@ -375,7 +495,11 @@ export default function App() {
           </nav>
           
           {view === 'dashboard' && (
-            <div className="space-y-4">
+            <motion.div 
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-4"
+            >
               <textarea 
                 placeholder="输入 URL (每行一个)"
                 value={urlInput}
@@ -388,7 +512,7 @@ export default function App() {
               >
                 <Plus size={16} /> 添加链接
               </button>
-            </div>
+            </motion.div>
           )}
         </div>
 
@@ -443,18 +567,27 @@ export default function App() {
                 <div className="flex gap-3">
                   <button 
                     onClick={handleAddUrls}
-                    className="flex-1 bg-black text-white py-2.5 rounded-xl text-sm font-semibold hover:bg-neutral-800 transition-all flex items-center justify-center gap-2"
+                    disabled={isProcessing}
+                    className="flex-1 bg-black text-white py-2.5 rounded-xl text-sm font-semibold hover:bg-neutral-800 disabled:bg-neutral-200 disabled:text-neutral-400 transition-all flex items-center justify-center gap-2"
                   >
                     <Plus size={16} /> 添加链接
                   </button>
-                  <button 
-                    onClick={handleStartAll}
-                    disabled={isProcessing || tasks.filter(t => t.status === 'pending' || t.status === 'error').length === 0}
-                    className="flex-1 bg-emerald-500 text-white py-2.5 rounded-xl text-sm font-semibold hover:bg-emerald-600 disabled:bg-neutral-200 disabled:text-neutral-400 transition-all flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
-                  >
-                    {isProcessing ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
-                    一键同步处理
-                  </button>
+                  {isProcessing ? (
+                    <button 
+                      onClick={handleCancelAll}
+                      className="flex-1 bg-red-500 text-white py-2.5 rounded-xl text-sm font-semibold hover:bg-red-600 transition-all flex items-center justify-center gap-2 shadow-lg shadow-red-500/20"
+                    >
+                      <X size={16} /> 取消处理
+                    </button>
+                  ) : (
+                    <button 
+                      onClick={handleStartAll}
+                      disabled={tasks.filter(t => t.status === 'pending' || t.status === 'error').length === 0}
+                      className="flex-1 bg-emerald-500 text-white py-2.5 rounded-xl text-sm font-semibold hover:bg-emerald-600 disabled:bg-neutral-200 disabled:text-neutral-400 transition-all flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20"
+                    >
+                      <Play size={16} /> 一键同步处理
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -524,7 +657,7 @@ export default function App() {
                   <p className="text-[10px] text-neutral-400">配置后，程序后台抓取文章和图片将通过此代理。如果您的 VPN 无法被程序识别，请在此手动输入代理地址。</p>
                 </div>
                 <button 
-                  onClick={handleSaveProxy}
+                  onClick={() => handleSaveProxy()}
                   className="w-full bg-black text-white py-2 rounded-xl text-sm font-semibold hover:bg-neutral-800 transition-all"
                 >
                   保存代理设置
@@ -582,7 +715,7 @@ export default function App() {
             </div>
           </div>
         )}
-      </aside>
+      </motion.aside>
 
       {/* Main Content */}
       <main className="flex-1 flex flex-col overflow-hidden">
@@ -753,18 +886,21 @@ export default function App() {
                     
                     {tasks.length > 0 ? (
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {tasks.map(task => (
-                          <motion.div
-                            layout
-                            key={task.id}
-                            initial={{ opacity: 0, scale: 0.9 }}
-                            animate={{ opacity: 1, scale: 1 }}
-                            className={`p-6 rounded-[2rem] border transition-all flex flex-col justify-between group relative ${
-                              task.status === 'done' ? 'bg-white border-emerald-100 shadow-sm' :
-                              task.status === 'error' ? 'bg-red-50/30 border-red-100' :
-                              'bg-white border-black/5'
-                            }`}
-                          >
+                <AnimatePresence mode="popLayout">
+                  {tasks.map(task => (
+                    <motion.div
+                      layout
+                      key={task.id}
+                      initial={{ opacity: 0, scale: 0.9, y: 20 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.9, transition: { duration: 0.2 } }}
+                      whileHover={{ y: -4, transition: { duration: 0.2 } }}
+                      className={`p-6 rounded-[2rem] border transition-all flex flex-col justify-between group relative ${
+                        task.status === 'done' ? 'bg-white border-emerald-100 shadow-sm' :
+                        task.status === 'error' ? 'bg-red-50/30 border-red-100' :
+                        'bg-white border-black/5'
+                      }`}
+                    >
                             <div className="space-y-4">
                               <div className="flex items-center justify-between">
                                 <div className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider ${
@@ -827,7 +963,8 @@ export default function App() {
                               )}
                             </div>
                           </motion.div>
-                        ))}
+                          ))}
+                        </AnimatePresence>
                       </div>
                     ) : (
                       <div className="h-[400px] flex flex-col items-center justify-center text-neutral-400 space-y-6 bg-white rounded-[3rem] border border-dashed border-neutral-200">
@@ -854,15 +991,21 @@ export default function App() {
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {prompts.map(p => (
-                  <div 
-                    key={p.id}
-                    className={`p-8 rounded-[2rem] border transition-all flex flex-col justify-between group ${
-                      activePromptId === p.id 
-                        ? 'bg-emerald-50 border-emerald-200 shadow-lg shadow-emerald-500/10' 
-                        : 'bg-white border-black/5 hover:border-neutral-300'
-                    }`}
-                  >
+                <AnimatePresence mode="popLayout">
+                  {prompts.map(p => (
+                    <motion.div 
+                      layout
+                      key={p.id}
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.9 }}
+                      whileHover={{ y: -4, transition: { duration: 0.2 } }}
+                      className={`p-8 rounded-[2rem] border transition-all flex flex-col justify-between group ${
+                        activePromptId === p.id 
+                          ? 'bg-emerald-50 border-emerald-200 shadow-lg shadow-emerald-500/10' 
+                          : 'bg-white border-black/5 hover:border-neutral-300'
+                      }`}
+                    >
                     <div className="space-y-4">
                       <div className="flex items-center justify-between">
                         <h3 className="font-bold text-xl">{p.name}</h3>
@@ -899,10 +1042,13 @@ export default function App() {
                         </button>
                       )}
                     </div>
-                  </div>
+                  </motion.div>
                 ))}
                 
-                <button 
+                <motion.button 
+                  layout
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
                   onClick={() => setEditingPrompt({ id: 'new', name: '', content: '' })}
                   className="p-8 rounded-[2rem] border-2 border-dashed border-neutral-200 hover:border-emerald-500 hover:bg-emerald-50/30 transition-all flex flex-col items-center justify-center text-neutral-400 hover:text-emerald-600 space-y-4 group"
                 >
@@ -910,8 +1056,9 @@ export default function App() {
                     <Plus size={24} />
                   </div>
                   <span className="font-bold">添加新提示词</span>
-                </button>
-              </div>
+                </motion.button>
+              </AnimatePresence>
+            </div>
             </div>
           </div>
         ) : (
@@ -923,8 +1070,12 @@ export default function App() {
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                <div className="space-y-6">
-                  <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6">
+                <motion.div 
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  className="space-y-6"
+                >
+                  <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6 hover:shadow-md transition-shadow">
                     <div className="flex items-center gap-3">
                       <div className="w-10 h-10 bg-emerald-100 text-emerald-600 rounded-xl flex items-center justify-center">
                         <Search size={20} />
@@ -935,16 +1086,31 @@ export default function App() {
                     <div className="space-y-4">
                       <div className="space-y-2">
                         <label className="text-sm font-bold text-neutral-600">HTTP/HTTPS 代理地址</label>
+                      <div className="flex gap-2">
                         <input 
                           type="text"
                           placeholder="例如: http://127.0.0.1:7890"
                           value={proxyUrl}
                           onChange={(e) => setProxyUrl(e.target.value)}
-                          className="w-full px-4 py-3 rounded-2xl border border-neutral-200 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10 outline-none transition-all"
+                          className="flex-1 px-4 py-3 rounded-2xl border border-neutral-200 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10 outline-none transition-all"
                         />
+                        {proxyUrl && (
+                          <button 
+                            type="button"
+                            onClick={() => {
+                              setProxyUrl('');
+                              handleSaveProxy('');
+                            }}
+                            className="px-4 py-3 bg-neutral-100 text-neutral-500 rounded-2xl hover:bg-neutral-200 transition-all"
+                            title="清除代理"
+                          >
+                            <X size={18} />
+                          </button>
+                        )}
+                      </div>
                       </div>
                       <button 
-                        onClick={handleSaveProxy}
+                        onClick={() => handleSaveProxy()}
                         className="w-full bg-black text-white py-3.5 rounded-2xl font-bold hover:bg-neutral-800 transition-all shadow-lg shadow-black/10"
                       >
                         应用代理设置
@@ -959,10 +1125,14 @@ export default function App() {
                       </p>
                     </div>
                   </div>
-                </div>
+                </motion.div>
 
-                <div className="space-y-6">
-                  <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6">
+                <motion.div 
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  className="space-y-6"
+                >
+                  <div className="bg-white p-8 rounded-[2.5rem] border border-black/5 shadow-sm space-y-6 hover:shadow-md transition-shadow">
                     <div className="flex items-center gap-3">
                       <div className="w-10 h-10 bg-blue-100 text-blue-600 rounded-xl flex items-center justify-center">
                         <RefreshCw size={20} />
@@ -1021,7 +1191,7 @@ export default function App() {
                       </motion.div>
                     )}
                   </div>
-                </div>
+                </motion.div>
               </div>
             </div>
           </div>
