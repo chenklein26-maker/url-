@@ -64,6 +64,7 @@ const MODEL_PRESETS: ModelPreset[] = [
   { id: 'deepseek-reasoner', name: 'DeepSeek R1', provider: 'deepseek', endpoint: 'https://api.deepseek.com/chat/completions', model: 'deepseek-reasoner' },
   { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o' },
   { id: 'gpt-4o-mini', name: 'GPT-4o Mini', provider: 'openai', endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o-mini' },
+  { id: 'qwen-plus', name: 'Qwen Plus', provider: 'qwen', endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', model: 'qwen-plus' },
   { id: 'custom', name: '自定义 (OpenAI 兼容)', provider: 'custom', endpoint: '', model: '' },
 ];
 
