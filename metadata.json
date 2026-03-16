@@ -1,0 +1,5 @@
+{
+  "name": "Article Flow",
+  "description": "Extract, polish, and process article images from any URL.",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,19 @@
+node_modules/
+dist/
+build/
+release/
+coverage/
+public/processed/
+data/
+
+# 重复项目副本，勿提交（若存在）
+url-/
+
+server-bundle.cjs
+
+.DS_Store
+Thumbs.db
+*.log
+
+.env*
+!.env.example
